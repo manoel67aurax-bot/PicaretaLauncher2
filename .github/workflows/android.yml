@@ -1,0 +1,85 @@
+name
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Arquitetura (arm64 = quase todo celular atual)"
+        default: "arm64"
+        type: choice
+        options: [arm64, arm, x86_64, all]
+      variant:
+        description: "Debug (pra testar) ou Release"
+        default: "Debug"
+        type: choice
+        options: [Debug, Release]
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ARCH: ${{ inputs.arch || 'arm64' }}
+      VARIANT: ${{ inputs.variant || 'Debug' }}
+      CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+      OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Pelo celular é mais fácil subir UM zip do que várias pastas: o workflow desempacota sozinho.
+      - name: Desempacotar overlay
+        run: |
+          if [ -f picareta-overlay.zip ]; then unzip -o -q picareta-overlay.zip && echo "overlay extraído"; fi
+          test -d picareta-core || { echo "::error::Faltou subir picareta-overlay.zip (ou as pastas picareta-core/picareta-ui)"; exit 1; }
+
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Rust + alvos Android
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-ndk
+            picareta-core/rust/target
+          key: picareta-rust-${{ runner.os }}-${{ hashFiles('picareta-core/rust/Cargo.toml') }}
+
+      - name: cargo-ndk
+        run: command -v cargo-ndk || cargo install cargo-ndk --locked
+
+      - name: Android NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.0.12077973" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      - name: Testes do núcleo Rust
+        working-directory: picareta-core/rust
+        run: cargo test --locked || cargo test
+
+      - name: Ligar módulos do Picareta
+        run: bash scripts/apply-picareta.sh
+
+      - name: Build APK
+        run: |
+          chmod +x gradlew
+          ./gradlew ZalithLauncher:assemble${VARIANT} -Darch=${ARCH} --stacktrace
+
+      - name: Enviar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: picareta-${{ env.VARIANT }}-${{ env.ARCH }}
+          path: ZalithLauncher/build/outputs/apk/**/*.apk
+          if-no-files-found: error
